@@ -24,9 +24,9 @@ import utils
 import fire
 
 
-def encode_prompt(prompt_instructions):
+def encode_prompt(prompt_path, prompt_instructions):
     """Encode multiple prompt instructions into a single string."""
-    prompt = open("./prompt.txt").read() + "\n"
+    prompt = open(prompt_path).read() + "\n"
 
     for idx, task_dict in enumerate(prompt_instructions):
         (instruction, input, output) = task_dict["instruction"], task_dict["input"], task_dict["output"]
@@ -106,10 +106,16 @@ def post_process_gpt3_response(num_prompt_instructions, response):
 def find_word_in_string(w, s):
     return re.compile(r"\b({0})\b".format(w), flags=re.IGNORECASE).search(s)
 
+def get_similatiry_entry(data_entry: dict, selected: list):
+    assert 0 < len(selected) <= len(data_entry)
+    return "\n".join(data_entry[key] for key in selected)
+
 
 def generate_instruction_following_data(
-    output_dir="./",
-    seed_tasks_path="./seed_tasks.jsonl",
+    output_dir="./data",
+    seed_tasks_path="./seed_tasks/seed_tasks.jsonl",
+    prompt_path="./prompts/prompt.txt",
+    sample_seed_only=False,
     num_instructions_to_generate=100,
     model_name="text-davinci-003",
     num_prompt_instructions=3,
@@ -117,6 +123,7 @@ def generate_instruction_following_data(
     temperature=1.0,
     top_p=1.0,
     num_cpus=16,
+    max_examples=10,
 ):
     seed_tasks = [json.loads(l) for l in open(seed_tasks_path, "r")]
     seed_instruction_data = [
@@ -129,8 +136,10 @@ def generate_instruction_following_data(
     request_idx = 0
     # load the LM-generated instructions
     machine_instruction_data = []
-    if os.path.exists(os.path.join(output_dir, "regen.json")):
-        machine_instruction_data = utils.jload(os.path.join(output_dir, "regen.json"))
+    seed_name = os.path.split(seed_tasks_path)[-1].split(".")[0]
+    output_name = f"{model_name}_regen_{seed_name}.json"
+    if os.path.exists(os.path.join(output_dir, output_name)):
+        machine_instruction_data = utils.jload(os.path.join(output_dir, output_name))
         print(f"Loaded {len(machine_instruction_data)} machine-generated instructions")
 
     # similarities = {}
@@ -142,26 +151,38 @@ def generate_instruction_following_data(
         progress_bar.update(len(machine_instruction_data))
 
     # first we tokenize all the seed instructions and generated machine instructions
-    all_instructions = [d["instruction"] for d in seed_instruction_data] + [
-        d["instruction"] for d in machine_instruction_data
+    #all_instructions = [d["instruction"] for d in seed_instruction_data] + [
+    #    d["instruction"] for d in machine_instruction_data
+    #]
+    all_instructions = [
+        get_similatiry_entry(d, ["instruction", "input"]) \
+            for d in seed_instruction_data
+    ] + [
+        get_similatiry_entry(d, ["instruction", "input"]) \
+            for d in machine_instruction_data
     ]
     all_instruction_tokens = [scorer._tokenizer.tokenize(inst) for inst in all_instructions]
 
     while len(machine_instruction_data) < num_instructions_to_generate:
+        all_instructions_data = seed_instruction_data + machine_instruction_data
         request_idx += 1
 
         batch_inputs = []
         for _ in range(request_batch_size):
-            # only sampling from the seed tasks
-            prompt_instructions = random.sample(seed_instruction_data, num_prompt_instructions)
-            prompt = encode_prompt(prompt_instructions)
+            if sample_seed_only:
+                # only sampling from the seed tasks
+                prompt_instructions = random.sample(seed_instruction_data, num_prompt_instructions)
+            else:
+                # sampling from the all instructions
+                prompt_instructions = random.sample(all_instructions_data, num_prompt_instructions)
+            prompt = encode_prompt(prompt_path, prompt_instructions)
             batch_inputs.append(prompt)
         decoding_args = utils.OpenAIDecodingArguments(
             temperature=temperature,
             n=1,
             max_tokens=3072,  # hard-code to maximize the length. the requests will be automatically adjusted
             top_p=top_p,
-            stop=["\n20", "20.", "20."],
+            stop=[f"\n{max_examples}", f"{max_examples}.", f"{max_examples} ."],
         )
         request_start = time.time()
         results = utils.openai_completion(
@@ -183,7 +204,10 @@ def generate_instruction_following_data(
         keep = 0
         for instruction_data_entry in instruction_data:
             # computing similarity with the pre-tokenzied instructions
-            new_instruction_tokens = scorer._tokenizer.tokenize(instruction_data_entry["instruction"])
+            new_instruction_tokens = scorer._tokenizer.tokenize(
+                #instruction_data_entry["instruction"]
+                get_similatiry_entry(instruction_data_entry, ["instruction", "input"]) \
+            )
             with Pool(num_cpus) as p:
                 rouge_scores = p.map(
                     partial(rouge_scorer._score_lcs, new_instruction_tokens),
@@ -206,7 +230,7 @@ def generate_instruction_following_data(
         process_duration = time.time() - process_start
         print(f"Request {request_idx} took {request_duration:.2f}s, processing took {process_duration:.2f}s")
         print(f"Generated {total} instructions, kept {keep} instructions")
-        utils.jdump(machine_instruction_data, os.path.join(output_dir, "regen.json"))
+        utils.jdump(machine_instruction_data, os.path.join(output_dir, output_name))
 
 
 def main(task, **kwargs):
